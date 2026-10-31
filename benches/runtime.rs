@@ -11,15 +11,16 @@
 //! inside the timed `block_on`; a `SharedRuntime` handle kept alive this way is also what a later
 //! `block_on` on the same thread resolves to, rather than a fresh runtime.
 //!
-//! `io/roundtrip-among-256-idle` is `io/roundtrip` again, while the runtime watches 256 sockets
-//! nothing is sent on, each with a task waiting to read from it: what a wait costs per watched
-//! socket, which a poller that keeps what it watches in the kernel leaves out.
+//! `io/roundtrip-among-256-idle` times the round trip of a byte, which a task on the same runtime
+//! echoes, while the runtime watches 256 sockets nothing is sent on, each with a task waiting to
+//! read from it: what a wait costs per watched socket, which a poller that keeps what it watches in
+//! the kernel leaves out, so that on such a poller it times the round trip alone.
 //!
-//! `io/roundtrip-among-128-unread-busy` is `io/roundtrip` again, while a task is ready at every
-//! turn, so that no wait can sleep, and 128 sockets are readable that nobody reads: what a source
-//! that is ready, and that nobody waits for, costs a busy runtime, which no wait after the first
-//! should report, whether the poller reports a source as it turns ready alone, or the runtime lets
-//! go of it.
+//! `io/roundtrip-among-128-unread-busy` is that round trip again, on a pair of its own, while a
+//! task is ready at every turn, so that no wait can sleep, and 128 sockets are readable that nobody
+//! reads: what a source that is ready, and that nobody waits for, costs a busy runtime, which no
+//! wait after the first should report, whether the poller reports a source as it turns ready alone,
+//! or the runtime lets go of it.
 //!
 //! `io/128-ready-at-once` makes a round trip on each of 128 pairs at once, so that a wait wakes
 //! more echo tasks than a batch polls: what a server that many clients keep busy sees, and what
@@ -54,10 +55,6 @@ fn timer_benches(c: &mut Criterion) {
     // handful of milliseconds; kept small so the group stays quick without losing the signal.
     let mut group = c.benchmark_group("timer");
     group.sample_size(20);
-    group.bench_function("sleep-1ms", |b| {
-        b.to_async(ZruntimeExecutor)
-            .iter(|| async { runtime.sleep(TIMER_DURATION).await });
-    });
     group.throughput(Throughput::Elements(100));
     group.bench_function("100-timers", |b| {
         b.to_async(ZruntimeExecutor).iter(|| async {
@@ -147,22 +144,8 @@ mod unix {
             );
         });
         {
-            let (local, far) = pair();
-            let registration = register(&runtime, &local);
-            let far_registration = register(&runtime, &far);
-            let _echo = runtime.spawn("bench echo", echo_forever(far_registration, far));
-            group.bench_function("roundtrip", |b| {
-                b.to_async(ZruntimeExecutor).iter(|| async {
-                    write_all(&registration, &local, &[7]).await;
-                    let mut response = [0u8; 1];
-                    read_exact(&registration, &local, &mut response).await;
-                    black_box(response);
-                });
-            });
-        }
-        {
-            // The round trip above, while the runtime watches as many sockets that nothing is
-            // sent on: a server's idle connections, each with a task waiting to read from it.
+            // A round trip, while the runtime watches as many sockets that nothing is sent on: a
+            // server's idle connections, each with a task waiting to read from it.
             // A wait on a poller that keeps what it watches in the kernel costs what the ready
             // sockets cost, and one on `poll(2)` a look at every watched socket.
             let _idle: Vec<_> = (0..IDLE)
