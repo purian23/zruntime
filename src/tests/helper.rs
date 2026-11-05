@@ -25,7 +25,7 @@ use socket2::SockRef;
 
 use super::{
     async_io::{BUDGET, READS, note_progress, tcp_pair_holding},
-    core::pair,
+    core::{address, pair},
     yield_now,
 };
 use crate::{
@@ -109,6 +109,34 @@ fn a_finished_task_whose_handle_is_dropped_leaves_nothing_behind() {
     // A helper that gave the seat up to the call above is parked until that call leaves and
     // rouses it, so the round it retires in comes a moment later.
     assert!(helper_gone(&runtime));
+}
+
+/// The free `block_on` runs the thread's own runtime once a poll has brought it into being, from
+/// the next poll on, and `SharedRuntime::running` hands it out then as `SharedRuntime::current`
+/// does. A task the helper thread runs finds the runtime the helper runs. Outside both, the thread
+/// is running none, where `SharedRuntime::current` would hand out the runtime the process shares.
+#[test]
+#[timeout(15000)]
+fn running_is_the_runtime_with_a_seat_the_thread_runs() {
+    let (running, current) = crate::block_on(async {
+        // Held to the end, as it is the thread's own runtime only while something holds it.
+        let current = SharedRuntime::current().unwrap();
+        yield_now().await;
+
+        (
+            SharedRuntime::running().map(|running| address(&running)),
+            address(&current),
+        )
+    });
+    assert_eq!(running, Some(current));
+
+    assert!(SharedRuntime::running().is_none());
+    let runtime = SharedRuntime::current().unwrap();
+    let task = runtime.spawn("a task asking for its runtime", async {
+        SharedRuntime::running().map(|running| address(&running))
+    });
+
+    assert_eq!(block_on(task).unwrap(), Some(address(&runtime)));
 }
 
 #[test]

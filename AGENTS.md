@@ -589,7 +589,8 @@ with `helper`, on what `SharedRuntime::current` resolves to, which differs from 
 that fallback brings into being while the thread is running the free `block_on` is held by that
 call from then on (`driver::current_to_spawn_on`), as nothing else would hold it, in a thread-local
 of its own (`HELD`) that, like the records, has no destructor. Both name the task by
-`Location::caller()` through `scheduler::Name`, which never allocates.
+`Location::caller()` through `scheduler::Name`, which never allocates. `Runtime::running` hands out
+the same record as a handle, for code that has none and needs the runtime for more than a spawn.
 
 **Sockets (the `net` features)**: every socket is an `AsyncIo<T, M>`: the std socket, non-blocking,
 in the mode's `Ptr` (`Rc`/`Arc`), of which the reactor holds a clone through the sealed
@@ -600,7 +601,13 @@ wait in them at once. The poll-based traits and the `Incoming` streams go throug
 and `poll_write_with` instead, and so through `Registration::poll_io`, which keeps one waker per
 direction: a socket serves one waiting reader and one waiting writer at a time through them, and
 neither kind of wait takes the place of the other. A stream implements `futures-io`'s traits for
-`&Stream` as well, which is how a reader and a writer share it. No socket is `Clone`.
+`&Stream` as well, which is how a reader and a writer share it. No socket is `Clone`. The streams
+and the datagram sockets also hand their `AsyncIo`'s `read_with`, `write_with`, `poll_read_with`
+and `poll_write_with` on, for operations of the caller's on the std socket that none of their own
+methods make, such as passing descriptors with `recvmsg` and `sendmsg`. `UnixStream::into_split` puts
+the stream in the mode's `Ptr` and hands out a `ReadHalf` and a `WriteHalf` that share it, each
+with the traits and the operations of its direction; dropping the write half shuts nothing down,
+unlike tokio's, and closing it shuts down the socket's write half, as closing the stream does.
 
 **Signals (the `signal` feature)**: what handles a signal is set for the process as a whole, so one
 registry serves every runtime and every listener: `REGISTRY` in `src/signal/mod.rs`, a `Mutex` of

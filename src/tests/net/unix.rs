@@ -55,7 +55,7 @@ use super::{DELAY, after, counting_polls, in_both_modes, pattern};
 use crate::{
     Local, Mode, Runtime, Shared, SharedRuntime,
     coop::{self, budgeted, spend},
-    net::unix::{Incoming, UnixDatagram, UnixListener, UnixStream},
+    net::unix::{Incoming, ReadHalf, UnixDatagram, UnixListener, UnixStream, WriteHalf},
     tests::core::counting_waker,
 };
 
@@ -1510,6 +1510,235 @@ in_both_modes! {
     }
 }
 
+in_both_modes! {
+    /// An operation of the caller's runs on the std stream: here a `sendmsg` that passes a file
+    /// descriptor along with the bytes, and the `recvmsg` that receives it. The receive starts
+    /// before anything is sent, so it waits for the stream to be readable first.
+    fn operations_of_the_callers_pass_file_descriptors<M>() {
+        use std::{
+            io::{IoSlice, IoSliceMut, PipeReader},
+            mem::MaybeUninit,
+            os::fd::{AsFd, OwnedFd},
+        };
+
+        use rustix::net::{
+            RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
+            SendAncillaryMessage, SendFlags, recvmsg, sendmsg,
+        };
+
+        let runtime = Runtime::<M>::new().unwrap();
+        let (client, server) = UnixStream::pair(&runtime).unwrap();
+        let (pipe_reader, mut pipe_writer) = std::io::pipe().unwrap();
+        pipe_writer.write_all(b"through the pipe").unwrap();
+        drop(pipe_writer);
+
+        let ((received, fds), sent) = runtime.block_on(async {
+            let receiving = async {
+                let mut bytes = [0; 16];
+                let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+                let mut control = RecvAncillaryBuffer::new(&mut space);
+                let len = server
+                    .read_with(|stream| {
+                        let mut iov = [IoSliceMut::new(&mut bytes)];
+                        Ok(recvmsg(stream, &mut iov, &mut control, RecvFlags::empty())?.bytes)
+                    })
+                    .await
+                    .unwrap();
+                let fds: Vec<OwnedFd> = control
+                    .drain()
+                    .flat_map(|message| match message {
+                        RecvAncillaryMessage::ScmRights(fds) => fds.collect(),
+                        _ => Vec::new(),
+                    })
+                    .collect();
+
+                (bytes[..len].to_vec(), fds)
+            };
+            let sending = async {
+                let fds = [pipe_reader.as_fd()];
+                let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+                let mut control = SendAncillaryBuffer::new(&mut space);
+                assert!(control.push(SendAncillaryMessage::ScmRights(&fds)));
+
+                client
+                    .write_with(|stream| {
+                        let iov = [IoSlice::new(b"ping")];
+                        Ok(sendmsg(stream, &iov, &mut control, SendFlags::empty())?)
+                    })
+                    .await
+                    .unwrap()
+            };
+
+            join(receiving, sending).await
+        });
+
+        assert_eq!(sent, 4);
+        assert_eq!(received, b"ping");
+        let [fd] = <[OwnedFd; 1]>::try_from(fds).unwrap();
+        let mut through_the_pipe = String::new();
+        PipeReader::from(fd).read_to_string(&mut through_the_pipe).unwrap();
+        assert_eq!(through_the_pipe, "through the pipe");
+    }
+}
+
+in_both_modes! {
+    /// The polling versions run the operation, and where it would block, have the task woken once
+    /// the stream is ready, after which the operation runs again.
+    fn polled_operations_wait_for_readiness<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (client, server) = UnixStream::pair(&runtime).unwrap();
+
+        runtime.block_on(async {
+            let mut reading = pin!(poll_fn(|cx| {
+                server.poll_read_with(cx, |mut stream| {
+                    let mut bytes = [0; 4];
+                    let len = stream.read(&mut bytes)?;
+
+                    Ok(bytes[..len].to_vec())
+                })
+            }));
+            assert!(poll_immediate(reading.as_mut()).await.is_none());
+
+            let written = poll_fn(|cx| client.poll_write_with(cx, |mut stream| stream.write(b"ping")))
+                .await
+                .unwrap();
+            assert_eq!(written, 4);
+            assert_eq!(reading.await.unwrap(), b"ping");
+        });
+    }
+}
+
+in_both_modes! {
+    /// A datagram socket runs operations of the caller's too, the receive waiting for a datagram to
+    /// arrive.
+    fn a_datagram_socket_runs_operations_of_the_callers<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (first, second) = UnixDatagram::pair(&runtime).unwrap();
+
+        let (received, sent) = runtime.block_on(async {
+            join(
+                second.read_with(|socket| {
+                    let mut bytes = [0; 16];
+                    let len = socket.recv(&mut bytes)?;
+
+                    Ok(bytes[..len].to_vec())
+                }),
+                first.write_with(|socket| socket.send(b"ping")),
+            )
+            .await
+        });
+
+        assert_eq!(sent.unwrap(), 4);
+        assert_eq!(received.unwrap(), b"ping");
+    }
+}
+
+in_both_modes! {
+    /// The halves of a split stream read and write on their own, each through its trait and
+    /// through operations of the caller's, and closing the write half ends the stream for the
+    /// peer, which can still answer.
+    fn the_halves_of_a_stream_read_and_write<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let directory = Directory::new("halves");
+
+        runtime.block_on(async {
+            let (client, mut server) = connected(&runtime, &directory).await;
+            let address = client.local_addr().unwrap();
+            let peer = client.peer_addr().unwrap();
+            let fd = client.as_raw_fd();
+            let (mut reader, mut writer) = client.into_split();
+            assert_eq!(reader.as_raw_fd(), fd);
+            assert_eq!(writer.as_raw_fd(), fd);
+            assert_eq!(reader.local_addr().unwrap().as_pathname(), address.as_pathname());
+            assert_eq!(writer.peer_addr().unwrap().as_pathname(), peer.as_pathname());
+
+            writer.write_all(b"ping").await.unwrap();
+            let written = writer.write_with(|mut stream| stream.write(b"!")).await.unwrap();
+            assert_eq!(written, 1);
+            writer.close().await.unwrap();
+            let mut message = Vec::new();
+            server.read_to_end(&mut message).await.unwrap();
+            assert_eq!(message, b"ping!");
+
+            server.write_all(b"pong!").await.unwrap();
+            let mut answer = [0; 4];
+            reader.read_exact(&mut answer).await.unwrap();
+            assert_eq!(&answer, b"pong");
+            let rest = reader
+                .read_with(|mut stream| {
+                    let mut bytes = [0; 1];
+                    let len = stream.read(&mut bytes)?;
+
+                    Ok(bytes[..len].to_vec())
+                })
+                .await
+                .unwrap();
+            assert_eq!(rest, b"!");
+        });
+    }
+}
+
+in_both_modes! {
+    /// Dropping the write half of a split stream shuts nothing down: the peer reads no end of the
+    /// stream, and the read half still receives what the peer sends. The socket closes once both
+    /// halves are dropped, and the peer then reads the end of the stream.
+    fn the_socket_of_a_split_stream_closes_with_both_halves<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (client, mut server) = UnixStream::pair(&runtime).unwrap();
+        let (mut reader, writer) = client.into_split();
+        drop(writer);
+
+        runtime.block_on(async {
+            let mut byte = [0; 1];
+            assert!(poll_immediate(server.read(&mut byte)).await.is_none());
+
+            server.write_all(b"?").await.unwrap();
+            reader.read_exact(&mut byte).await.unwrap();
+            assert_eq!(&byte, b"?");
+
+            drop(reader);
+            assert_eq!(server.read(&mut byte).await.unwrap(), 0);
+        });
+    }
+}
+
+/// The halves of a shared stream move to threads other than the one that split it, each of which
+/// uses its half there. Each drives the runtime with a `block_on` of its own, one after the other,
+/// since a runtime made by `new` is driven by one thread at a time.
+#[test]
+#[timeout(15000)]
+fn the_halves_of_a_shared_stream_cross_threads() {
+    let runtime = SharedRuntime::new().unwrap();
+    let (client, mut server) = UnixStream::pair(&runtime).unwrap();
+    let (mut reader, mut writer) = client.into_split();
+
+    thread::spawn({
+        let runtime = runtime.clone();
+        move || runtime.block_on(writer.write_all(b"ping"))
+    })
+    .join()
+    .unwrap()
+    .unwrap();
+    let mut message = [0; 4];
+    runtime.block_on(server.read_exact(&mut message)).unwrap();
+    assert_eq!(&message, b"ping");
+
+    runtime.block_on(server.write_all(b"pong")).unwrap();
+    let answer = thread::spawn({
+        let runtime = runtime.clone();
+        move || {
+            let mut answer = [0; 4];
+            runtime
+                .block_on(reader.read_exact(&mut answer))
+                .map(|()| answer)
+        }
+    })
+    .join()
+    .unwrap()
+    .unwrap();
+    assert_eq!(&answer, b"pong");
+}
+
 /// A shared runtime's sockets are `Send` and `Sync`, and `Unpin`, which the extension traits of
 /// futures ask of what they read from, write to or iterate over.
 ///
@@ -1529,6 +1758,8 @@ fn shared_sockets_are_send_sync_and_unpin() {
     sent_and_shared::<UnixStream<Shared>>();
     sent_and_shared::<UnixDatagram<Shared>>();
     sent_and_shared::<Incoming<'static, Shared>>();
+    sent_and_shared::<ReadHalf<Shared>>();
+    sent_and_shared::<WriteHalf<Shared>>();
 }
 
 /// A local runtime's sockets are `Unpin` too. That they are neither `Send` nor `Sync` is shown by
@@ -1546,6 +1777,8 @@ fn local_sockets_are_unpin() {
     unpin::<UnixStream<Local>>();
     unpin::<UnixDatagram<Local>>();
     unpin::<Incoming<'static, Local>>();
+    unpin::<ReadHalf<Local>>();
+    unpin::<WriteHalf<Local>>();
 }
 
 /// A connected pair: the end that connected, and the end the listener accepted.

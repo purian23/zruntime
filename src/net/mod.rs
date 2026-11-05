@@ -35,18 +35,26 @@
 //! stream implements the traits too, so a reader and a writer can share one stream. Closing a
 //! stream shuts down its write half, and the peer then reads the end of the stream.
 //!
+//! The streams and the datagram sockets can also run an operation of the caller's on the std
+//! socket, for what their own methods do not do, such as passing file descriptors over a
+//! unix-domain socket with `recvmsg` and `sendmsg`: `read_with` and `write_with` run it until it no
+//! longer fails with [`WouldBlock`](std::io::ErrorKind::WouldBlock), waiting for the socket to be
+//! ready in between, and `poll_read_with` and `poll_write_with` are their polling versions.
+//!
 //! # Several tasks on one socket
 //!
 //! Any number of tasks can wait in the async methods of one socket at once, through shared
-//! references. These are the methods that accept, peek, receive or send, in either direction. When
-//! the socket becomes ready, the waiting tasks wake. A task that finds another task took the data
-//! first waits again.
+//! references. These are the methods that accept, peek, receive or send, in either direction, and
+//! `read_with` and `write_with`. When the socket becomes ready, the waiting tasks wake. A task that
+//! finds another task took the data first waits again.
 //!
 //! Two paths allow only one waiting task per direction: the `AsyncRead` and `AsyncWrite`
-//! implementations of a stream, and the `Incoming` stream of a listener. If a second task waits in
-//! the same direction through one of them, it replaces the first, which is then never woken. Tasks
-//! that share a direction there must take turns, for example behind a lock. A task waiting in an
-//! async method never replaces a task waiting through one of these paths, nor the other way round.
+//! implementations of a stream, together with the `poll_read_with` and `poll_write_with` that the
+//! streams and the datagram sockets have, and the `Incoming` stream of a listener. If a second task
+//! waits in the same direction through one of them, it replaces the first, which is then never
+//! woken. Tasks that share a direction there must take turns, for example behind a lock. A task
+//! waiting in an async method never replaces a task waiting through one of these paths, nor the
+//! other way round.
 //!
 //! # Limits on Windows
 //!

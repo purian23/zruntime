@@ -7,6 +7,7 @@ use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, RawSocket};
 use std::{
     fmt, io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    task::{Context, Poll},
 };
 
 use crate::{AsyncIo, Local, Mode, Runtime};
@@ -356,6 +357,78 @@ where
     /// This is the time-to-live field of the IP packets sent from the socket.
     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
         self.io.get_ref().set_ttl(ttl)
+    }
+
+    /// Runs `operation` on the socket until it no longer fails with
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock), waiting for the socket to be readable in between.
+    ///
+    /// This is for a read that the methods of this type do not make, such as a `recvmsg` that
+    /// receives the ancillary data of a datagram. `operation` gets the std socket, which is in
+    /// non-blocking mode, and must not block: it runs on the thread that all tasks of the runtime
+    /// share. This returns, retries and waits as [`AsyncIo::read_with`] does, so any number of
+    /// tasks can do this at once.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future gives up the wait, and never leaves an operation half done.
+    pub async fn read_with<R>(
+        &self,
+        operation: impl FnMut(&std::net::UdpSocket) -> io::Result<R>,
+    ) -> io::Result<R> {
+        self.io.read_with(operation).await
+    }
+
+    /// Runs `operation` on the socket until it no longer fails with
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock), waiting for the socket to be writable in between.
+    ///
+    /// This is for a write that the methods of this type do not make, such as a `sendmsg` that
+    /// sends ancillary data along with a datagram. `operation` gets the std socket, which is in
+    /// non-blocking mode, and must not block: it runs on the thread that all tasks of the runtime
+    /// share. This returns, retries and waits as [`AsyncIo::write_with`] does, so any number of
+    /// tasks can do this at once.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future gives up the wait, and never leaves an operation half done.
+    pub async fn write_with<R>(
+        &self,
+        operation: impl FnMut(&std::net::UdpSocket) -> io::Result<R>,
+    ) -> io::Result<R> {
+        self.io.write_with(operation).await
+    }
+
+    /// The polling version of [`read_with`](UdpSocket::read_with), for implementing poll-based
+    /// traits.
+    ///
+    /// Runs `operation` on the socket. If it fails with [`WouldBlock`](io::ErrorKind::WouldBlock),
+    /// this arranges for the waker of `cx` to be woken once the socket is readable, and returns
+    /// [`Poll::Pending`], as [`AsyncIo::poll_read_with`] does.
+    ///
+    /// It keeps only one waiting task for reading. A second task that waits replaces the first one,
+    /// which is then never woken.
+    pub fn poll_read_with<R>(
+        &self,
+        cx: &mut Context<'_>,
+        operation: impl FnMut(&std::net::UdpSocket) -> io::Result<R>,
+    ) -> Poll<io::Result<R>> {
+        self.io.poll_read_with(cx, operation)
+    }
+
+    /// The polling version of [`write_with`](UdpSocket::write_with), for implementing poll-based
+    /// traits.
+    ///
+    /// Runs `operation` on the socket. If it fails with [`WouldBlock`](io::ErrorKind::WouldBlock),
+    /// this arranges for the waker of `cx` to be woken once the socket is writable, and returns
+    /// [`Poll::Pending`], as [`AsyncIo::poll_write_with`] does.
+    ///
+    /// It keeps only one waiting task for writing. A second task that waits replaces the first one,
+    /// which is then never woken.
+    pub fn poll_write_with<R>(
+        &self,
+        cx: &mut Context<'_>,
+        operation: impl FnMut(&std::net::UdpSocket) -> io::Result<R>,
+    ) -> Poll<io::Result<R>> {
+        self.io.poll_write_with(cx, operation)
     }
 }
 

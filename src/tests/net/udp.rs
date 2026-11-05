@@ -20,7 +20,7 @@ use std::os::fd::AsRawFd;
 use std::os::windows::io::AsRawSocket;
 use std::{
     cell::Cell,
-    future::Future,
+    future::{Future, poll_fn},
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddrV4},
     pin::pin,
@@ -592,6 +592,54 @@ in_both_modes! {
         // seen to be of the socket itself: it finds the address that socket has.
         let found = SockRef::from(&socket).local_addr().unwrap();
         assert_eq!(found.as_socket(), Some(address));
+    }
+}
+
+in_both_modes! {
+    /// An operation of the caller's runs on the std socket: here std's `peek_from`, which leaves
+    /// the datagram for the receive that follows, and which waits for one to arrive, as it starts
+    /// before anything is sent. The polling versions run one too.
+    fn operations_of_the_callers_run_on_the_std_socket<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (client, server) = pair(&runtime);
+        let server_address = server.local_addr().unwrap();
+
+        runtime.block_on(async {
+            let (peeked, sent) = join(
+                server.read_with(|socket| {
+                    let mut bytes = [0; 16];
+                    let (len, from) = socket.peek_from(&mut bytes)?;
+
+                    Ok((bytes[..len].to_vec(), from))
+                }),
+                client.write_with(|socket| socket.send_to(b"ping", server_address)),
+            )
+            .await;
+            assert_eq!(sent.unwrap(), 4);
+            assert_eq!(peeked.unwrap(), (b"ping".to_vec(), client.local_addr().unwrap()));
+
+            let mut received = [0; 16];
+            let (len, _) = server.recv_from(&mut received).await.unwrap();
+            assert_eq!(&received[..len], b"ping");
+
+            let sent = poll_fn(|cx| {
+                client.poll_write_with(cx, |socket| socket.send_to(b"pong", server_address))
+            })
+            .await
+            .unwrap();
+            assert_eq!(sent, 4);
+            let received = poll_fn(|cx| {
+                server.poll_read_with(cx, |socket| {
+                    let mut bytes = [0; 16];
+                    let (len, _) = socket.recv_from(&mut bytes)?;
+
+                    Ok(bytes[..len].to_vec())
+                })
+            })
+            .await
+            .unwrap();
+            assert_eq!(received, b"pong");
+        });
     }
 }
 
