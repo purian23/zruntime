@@ -305,6 +305,52 @@ where
         })
     }
 
+    /// The runtime of this flavour that the calling thread is running, if it is running one.
+    ///
+    /// That is the runtime the thread called [`Runtime::block_on`] on, or the runtime whose task
+    /// it is running, on a thread that called `block_on` or on a helper thread. It is the runtime
+    /// that the free [`spawn`] or [`spawn_local`] puts a task on, so code that has no runtime
+    /// handle, such as a function called from a task, can build timers and sockets on the runtime
+    /// that runs it.
+    ///
+    /// Inside the free `block_on`, it is the thread's own runtime while the thread runs it, which
+    /// it starts to do after the poll that first builds work on that runtime, and so brings it into
+    /// being. `SharedRuntime::current` hands that runtime out from the start.
+    ///
+    /// Returns `None` where the thread is running no runtime of this flavour: outside any
+    /// `block_on`, and inside the `block_on` of a runtime of the other flavour. Unlike
+    /// `SharedRuntime::current`, this never creates a runtime.
+    ///
+    /// As with [`Runtime::new`], call [`LocalRuntime::running`] or [`SharedRuntime::running`], or
+    /// name the flavour with a turbofish.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use zruntime::{LocalRuntime, SharedRuntime};
+    ///
+    /// // A function that is given no runtime, and sleeps on whichever local one is running it.
+    /// async fn nap() {
+    ///     let runtime = LocalRuntime::running().expect("called from a local runtime");
+    ///     runtime.sleep(Duration::from_millis(1)).await;
+    /// }
+    ///
+    /// assert!(LocalRuntime::running().is_none());
+    ///
+    /// let runtime = LocalRuntime::new().unwrap();
+    /// runtime.block_on(async {
+    ///     nap().await;
+    ///
+    ///     // A local runtime is running here, and no shared one.
+    ///     assert!(SharedRuntime::running().is_none());
+    /// });
+    /// ```
+    pub fn running() -> Option<Self> {
+        M::driven().map(|core| Self { core })
+    }
+
     /// Runs `future` to completion on the calling thread, and runs this runtime alongside it.
     ///
     /// The call blocks the thread until `future` completes. Meanwhile, the thread also runs the

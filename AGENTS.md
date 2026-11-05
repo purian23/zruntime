@@ -589,7 +589,8 @@ with `helper`, on what `SharedRuntime::current` resolves to, which differs from 
 that fallback brings into being while the thread is running the free `block_on` is held by that
 call from then on (`driver::current_to_spawn_on`), as nothing else would hold it, in a thread-local
 of its own (`HELD`) that, like the records, has no destructor. Both name the task by
-`Location::caller()` through `scheduler::Name`, which never allocates.
+`Location::caller()` through `scheduler::Name`, which never allocates. `Runtime::running` hands out
+the same record as a handle, for code that has none and needs the runtime for more than a spawn.
 
 **Sockets (the `net` features)**: every socket is an `AsyncIo<T, M>`: the std socket, non-blocking,
 in the mode's `Ptr` (`Rc`/`Arc`), of which the reactor holds a clone through the sealed

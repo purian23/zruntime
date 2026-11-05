@@ -1878,6 +1878,40 @@ fn spawn_puts_the_task_on_the_runtime_the_thread_drives() {
     assert_eq!(other.core.scheduler.live_tasks(), 0);
 }
 
+in_both_modes! {
+    /// The runtime a thread is running is the one it is inside `block_on` on, from the future of
+    /// that call and from inside a task of the runtime alike. Outside the call, before it and after
+    /// it, the thread is running none.
+    fn running_is_the_runtime_the_thread_drives<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        assert!(Runtime::<M>::running().is_none());
+
+        let (from_block_on, from_a_task) = runtime.block_on(async {
+            let from_block_on = Runtime::<M>::running().map(|running| address(&running));
+            let task = M::spawn(&runtime, "a task asking for its runtime", async {
+                Runtime::<M>::running().map(|running| address(&running))
+            });
+
+            (from_block_on, task.await.unwrap())
+        });
+
+        assert_eq!(from_block_on, Some(address(&runtime)));
+        assert_eq!(from_a_task, Some(address(&runtime)));
+        assert!(Runtime::<M>::running().is_none());
+    }
+}
+
+/// A thread running a runtime of one flavour is running none of the other.
+#[test]
+#[timeout(15000)]
+fn running_finds_no_runtime_of_the_other_flavour() {
+    let local = LocalRuntime::new().unwrap();
+    assert!(local.block_on(async { SharedRuntime::running().is_none() }));
+
+    let shared = SharedRuntime::new().unwrap();
+    assert!(shared.block_on(async { LocalRuntime::running().is_none() }));
+}
+
 /// A local task has no runtime to go on where the thread drives no local runtime: outside any
 /// `block_on`, and inside the `block_on` of a shared runtime, whose tasks may run on any thread. A
 /// call that panics leaves the runtime it was made inside driving as before.
@@ -2439,4 +2473,13 @@ fn connected() -> (Socket, Socket) {
     far.set_nodelay(true).unwrap();
 
     (near.into(), far.into())
+}
+
+/// The address of what `runtime` is a handle on, which tells two handles on one runtime from
+/// handles on two, and which, unlike a handle on a local runtime, can be sent between threads.
+pub(super) fn address<M>(runtime: &Runtime<M>) -> usize
+where
+    M: Mode,
+{
+    std::ptr::from_ref(&*runtime.core).addr()
 }
