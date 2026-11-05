@@ -958,6 +958,51 @@ in_both_modes! {
     }
 }
 
+in_both_modes! {
+    /// An operation of the caller's runs on the std stream: here std's `peek`, which leaves the
+    /// bytes for the read that follows, and which waits for the stream to be readable, as it starts
+    /// before anything is written.
+    fn operations_of_the_callers_run_on_the_std_stream<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+
+        runtime.block_on(async {
+            let (client, mut server) = connected(&runtime).await;
+            let (peeked, written) = join(
+                server.read_with(|stream| {
+                    let mut bytes = [0; 4];
+                    let len = stream.peek(&mut bytes)?;
+
+                    Ok(bytes[..len].to_vec())
+                }),
+                client.write_with(|mut stream| stream.write(b"ping")),
+            )
+            .await;
+            assert_eq!(written.unwrap(), 4);
+            assert_eq!(peeked.unwrap(), b"ping");
+
+            let mut received = [0; 4];
+            server.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, b"ping");
+
+            // And the polling versions, the other way round.
+            server.write_all(b"pong").await.unwrap();
+            let answer = poll_fn(|cx| {
+                client.poll_read_with(cx, |mut stream| {
+                    let mut bytes = [0; 4];
+                    let len = stream.read(&mut bytes)?;
+
+                    Ok(bytes[..len].to_vec())
+                })
+            })
+            .await
+            .unwrap();
+            assert_eq!(answer, b"pong");
+            let written = poll_fn(|cx| client.poll_write_with(cx, |mut stream| stream.write(b"!")));
+            assert_eq!(written.await.unwrap(), 1);
+        });
+    }
+}
+
 /// A shared runtime's sockets are `Send` and `Sync`, and `Unpin`, which the extension traits of
 /// futures ask of what they read from, write to or iterate over.
 ///

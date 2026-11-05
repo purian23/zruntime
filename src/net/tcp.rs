@@ -524,6 +524,82 @@ where
     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
         self.io.get_ref().set_ttl(ttl)
     }
+
+    /// Runs `operation` on the stream until it no longer fails with
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock), waiting for the stream to be readable in between.
+    ///
+    /// This is for a read that the methods of this type do not make, such as a `recv` with flags of
+    /// its own. `operation` gets the std stream, which is in non-blocking mode, and must not block:
+    /// it runs on the thread that all tasks of the runtime share. This returns, retries and waits
+    /// as [`AsyncIo::read_with`] does, so any number of tasks can do this at once.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future gives up the wait, and never leaves an operation half done.
+    pub async fn read_with<R>(
+        &self,
+        operation: impl FnMut(&std::net::TcpStream) -> io::Result<R>,
+    ) -> io::Result<R> {
+        self.io.read_with(operation).await
+    }
+
+    /// Runs `operation` on the stream until it no longer fails with
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock), waiting for the stream to be writable in between.
+    ///
+    /// This is for a write that the methods of this type do not make, such as a `send` with flags
+    /// of its own. `operation` gets the std stream, which is in non-blocking mode, and must not
+    /// block: it runs on the thread that all tasks of the runtime share. This returns, retries and
+    /// waits as [`AsyncIo::write_with`] does, so any number of tasks can do this at once.
+    ///
+    /// On unix, a write to a peer that has gone away raises `SIGPIPE` unless the operation sends
+    /// with `MSG_NOSIGNAL`, as the writes of this type do. Apple's platforms have no such flag, so
+    /// there the stream has `SO_NOSIGPIPE` set instead, which makes such a write fail too.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future gives up the wait, and never leaves an operation half done.
+    pub async fn write_with<R>(
+        &self,
+        operation: impl FnMut(&std::net::TcpStream) -> io::Result<R>,
+    ) -> io::Result<R> {
+        self.io.write_with(operation).await
+    }
+
+    /// The polling version of [`read_with`](TcpStream::read_with), for implementing poll-based
+    /// traits.
+    ///
+    /// Runs `operation` on the stream. If it fails with [`WouldBlock`](io::ErrorKind::WouldBlock),
+    /// this arranges for the waker of `cx` to be woken once the stream is readable, and returns
+    /// [`Poll::Pending`], as [`AsyncIo::poll_read_with`] does.
+    ///
+    /// It keeps one waiting task for reading, the one the `AsyncRead` implementation keeps too: a
+    /// task that waits through either replaces a task waiting through the other, which is then
+    /// never woken.
+    pub fn poll_read_with<R>(
+        &self,
+        cx: &mut Context<'_>,
+        operation: impl FnMut(&std::net::TcpStream) -> io::Result<R>,
+    ) -> Poll<io::Result<R>> {
+        self.io.poll_read_with(cx, operation)
+    }
+
+    /// The polling version of [`write_with`](TcpStream::write_with), for implementing poll-based
+    /// traits.
+    ///
+    /// Runs `operation` on the stream. If it fails with [`WouldBlock`](io::ErrorKind::WouldBlock),
+    /// this arranges for the waker of `cx` to be woken once the stream is writable, and returns
+    /// [`Poll::Pending`], as [`AsyncIo::poll_write_with`] does.
+    ///
+    /// It keeps one waiting task for writing, the one the `AsyncWrite` implementation keeps too: a
+    /// task that waits through either replaces a task waiting through the other, which is then
+    /// never woken.
+    pub fn poll_write_with<R>(
+        &self,
+        cx: &mut Context<'_>,
+        operation: impl FnMut(&std::net::TcpStream) -> io::Result<R>,
+    ) -> Poll<io::Result<R>> {
+        self.io.poll_write_with(cx, operation)
+    }
 }
 
 impl<M> AsyncRead for TcpStream<M>

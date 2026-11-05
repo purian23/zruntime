@@ -1510,6 +1510,129 @@ in_both_modes! {
     }
 }
 
+in_both_modes! {
+    /// An operation of the caller's runs on the std stream: here a `sendmsg` that passes a file
+    /// descriptor along with the bytes, and the `recvmsg` that receives it. The receive starts
+    /// before anything is sent, so it waits for the stream to be readable first.
+    fn operations_of_the_callers_pass_file_descriptors<M>() {
+        use std::{
+            io::{IoSlice, IoSliceMut, PipeReader},
+            mem::MaybeUninit,
+            os::fd::{AsFd, OwnedFd},
+        };
+
+        use rustix::net::{
+            RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
+            SendAncillaryMessage, SendFlags, recvmsg, sendmsg,
+        };
+
+        let runtime = Runtime::<M>::new().unwrap();
+        let (client, server) = UnixStream::pair(&runtime).unwrap();
+        let (pipe_reader, mut pipe_writer) = std::io::pipe().unwrap();
+        pipe_writer.write_all(b"through the pipe").unwrap();
+        drop(pipe_writer);
+
+        let ((received, fds), sent) = runtime.block_on(async {
+            let receiving = async {
+                let mut bytes = [0; 16];
+                let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+                let mut control = RecvAncillaryBuffer::new(&mut space);
+                let len = server
+                    .read_with(|stream| {
+                        let mut iov = [IoSliceMut::new(&mut bytes)];
+                        Ok(recvmsg(stream, &mut iov, &mut control, RecvFlags::empty())?.bytes)
+                    })
+                    .await
+                    .unwrap();
+                let fds: Vec<OwnedFd> = control
+                    .drain()
+                    .flat_map(|message| match message {
+                        RecvAncillaryMessage::ScmRights(fds) => fds.collect(),
+                        _ => Vec::new(),
+                    })
+                    .collect();
+
+                (bytes[..len].to_vec(), fds)
+            };
+            let sending = async {
+                let fds = [pipe_reader.as_fd()];
+                let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+                let mut control = SendAncillaryBuffer::new(&mut space);
+                assert!(control.push(SendAncillaryMessage::ScmRights(&fds)));
+
+                client
+                    .write_with(|stream| {
+                        let iov = [IoSlice::new(b"ping")];
+                        Ok(sendmsg(stream, &iov, &mut control, SendFlags::empty())?)
+                    })
+                    .await
+                    .unwrap()
+            };
+
+            join(receiving, sending).await
+        });
+
+        assert_eq!(sent, 4);
+        assert_eq!(received, b"ping");
+        let [fd] = <[OwnedFd; 1]>::try_from(fds).unwrap();
+        let mut through_the_pipe = String::new();
+        PipeReader::from(fd).read_to_string(&mut through_the_pipe).unwrap();
+        assert_eq!(through_the_pipe, "through the pipe");
+    }
+}
+
+in_both_modes! {
+    /// The polling versions run the operation, and where it would block, have the task woken once
+    /// the stream is ready, after which the operation runs again.
+    fn polled_operations_wait_for_readiness<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (client, server) = UnixStream::pair(&runtime).unwrap();
+
+        runtime.block_on(async {
+            let mut reading = pin!(poll_fn(|cx| {
+                server.poll_read_with(cx, |mut stream| {
+                    let mut bytes = [0; 4];
+                    let len = stream.read(&mut bytes)?;
+
+                    Ok(bytes[..len].to_vec())
+                })
+            }));
+            assert!(poll_immediate(reading.as_mut()).await.is_none());
+
+            let written = poll_fn(|cx| client.poll_write_with(cx, |mut stream| stream.write(b"ping")))
+                .await
+                .unwrap();
+            assert_eq!(written, 4);
+            assert_eq!(reading.await.unwrap(), b"ping");
+        });
+    }
+}
+
+in_both_modes! {
+    /// A datagram socket runs operations of the caller's too, the receive waiting for a datagram to
+    /// arrive.
+    fn a_datagram_socket_runs_operations_of_the_callers<M>() {
+        let runtime = Runtime::<M>::new().unwrap();
+        let (first, second) = UnixDatagram::pair(&runtime).unwrap();
+
+        let (received, sent) = runtime.block_on(async {
+            join(
+                second.read_with(|socket| {
+                    let mut bytes = [0; 16];
+                    let len = socket.recv(&mut bytes)?;
+
+                    Ok(bytes[..len].to_vec())
+                }),
+                first.write_with(|socket| socket.send(b"ping")),
+            )
+            .await
+        });
+
+        assert_eq!(sent.unwrap(), 4);
+        assert_eq!(received.unwrap(), b"ping");
+    }
+}
+
 /// A shared runtime's sockets are `Send` and `Sync`, and `Unpin`, which the extension traits of
 /// futures ask of what they read from, write to or iterate over.
 ///

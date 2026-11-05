@@ -451,6 +451,115 @@ where
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         self.io.get_ref().shutdown(how)
     }
+
+    /// Runs `operation` on the stream until it no longer fails with
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock), waiting for the stream to be readable in between.
+    ///
+    /// This is for a read that the methods of this type do not make, such as a `recvmsg` that
+    /// receives file descriptors along with the bytes. `operation` gets the std stream, which is in
+    /// non-blocking mode, and must not block: it runs on the thread that all tasks of the runtime
+    /// share. This returns, retries and waits as [`AsyncIo::read_with`] does, so any number of
+    /// tasks can do this at once.
+    ///
+    /// # Example
+    ///
+    /// A peek, which leaves the bytes it reads in the socket for the next read, made with rustix's
+    /// `recv` and its `PEEK` flag.
+    ///
+    /// ```
+    /// use futures::{AsyncReadExt, AsyncWriteExt};
+    /// use rustix::net::{RecvFlags, recv};
+    /// use zruntime::{LocalRuntime, net::unix::UnixStream};
+    ///
+    /// let runtime = LocalRuntime::new()?;
+    /// let (mut client, mut server) = UnixStream::pair(&runtime)?;
+    ///
+    /// runtime.block_on(async {
+    ///     client.write_all(b"ping").await?;
+    ///
+    ///     let mut peeked = [0; 4];
+    ///     let (len, _) = server
+    ///         .read_with(|stream| Ok(recv(stream, &mut peeked, RecvFlags::PEEK)?))
+    ///         .await?;
+    ///     assert_eq!(&peeked[..len], b"ping");
+    ///
+    ///     // The bytes are still there to read.
+    ///     let mut read = [0; 4];
+    ///     server.read_exact(&mut read).await?;
+    ///     assert_eq!(&read, b"ping");
+    ///     # Ok::<_, std::io::Error>(())
+    /// })?;
+    /// # Ok::<_, std::io::Error>(())
+    /// ```
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future gives up the wait, and never leaves an operation half done.
+    pub async fn read_with<R>(
+        &self,
+        operation: impl FnMut(&std::os::unix::net::UnixStream) -> io::Result<R>,
+    ) -> io::Result<R> {
+        self.io.read_with(operation).await
+    }
+
+    /// Runs `operation` on the stream until it no longer fails with
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock), waiting for the stream to be writable in between.
+    ///
+    /// This is for a write that the methods of this type do not make, such as a `sendmsg` that
+    /// sends file descriptors along with the bytes. `operation` gets the std stream, which is in
+    /// non-blocking mode, and must not block: it runs on the thread that all tasks of the runtime
+    /// share. This returns, retries and waits as [`AsyncIo::write_with`] does, so any number of
+    /// tasks can do this at once.
+    ///
+    /// On unix, a write to a peer that has gone away raises `SIGPIPE` unless the operation sends
+    /// with `MSG_NOSIGNAL`, as the writes of this type do. Apple's platforms have no such flag, so
+    /// there the stream has `SO_NOSIGPIPE` set instead, which makes such a write fail too.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future gives up the wait, and never leaves an operation half done.
+    pub async fn write_with<R>(
+        &self,
+        operation: impl FnMut(&std::os::unix::net::UnixStream) -> io::Result<R>,
+    ) -> io::Result<R> {
+        self.io.write_with(operation).await
+    }
+
+    /// The polling version of [`read_with`](UnixStream::read_with), for implementing poll-based
+    /// traits.
+    ///
+    /// Runs `operation` on the stream. If it fails with [`WouldBlock`](io::ErrorKind::WouldBlock),
+    /// this arranges for the waker of `cx` to be woken once the stream is readable, and returns
+    /// [`Poll::Pending`], as [`AsyncIo::poll_read_with`] does.
+    ///
+    /// It keeps one waiting task for reading, the one the `AsyncRead` implementation keeps too: a
+    /// task that waits through either replaces a task waiting through the other, which is then
+    /// never woken.
+    pub fn poll_read_with<R>(
+        &self,
+        cx: &mut Context<'_>,
+        operation: impl FnMut(&std::os::unix::net::UnixStream) -> io::Result<R>,
+    ) -> Poll<io::Result<R>> {
+        self.io.poll_read_with(cx, operation)
+    }
+
+    /// The polling version of [`write_with`](UnixStream::write_with), for implementing poll-based
+    /// traits.
+    ///
+    /// Runs `operation` on the stream. If it fails with [`WouldBlock`](io::ErrorKind::WouldBlock),
+    /// this arranges for the waker of `cx` to be woken once the stream is writable, and returns
+    /// [`Poll::Pending`], as [`AsyncIo::poll_write_with`] does.
+    ///
+    /// It keeps one waiting task for writing, the one the `AsyncWrite` implementation keeps too: a
+    /// task that waits through either replaces a task waiting through the other, which is then
+    /// never woken.
+    pub fn poll_write_with<R>(
+        &self,
+        cx: &mut Context<'_>,
+        operation: impl FnMut(&std::os::unix::net::UnixStream) -> io::Result<R>,
+    ) -> Poll<io::Result<R>> {
+        self.io.poll_write_with(cx, operation)
+    }
 }
 
 impl<M> AsyncRead for UnixStream<M>
@@ -849,6 +958,95 @@ where
     /// [`BrokenPipe`](io::ErrorKind::BrokenPipe).
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         self.io.get_ref().shutdown(how)
+    }
+
+    /// Runs `operation` on the socket until it no longer fails with
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock), waiting for the socket to be readable in between.
+    ///
+    /// This is for a read that the methods of this type do not make, such as a `recvmsg` that
+    /// receives file descriptors along with a datagram. `operation` gets the std socket, which is
+    /// in non-blocking mode, and must not block: it runs on the thread that all tasks of the
+    /// runtime share. This returns, retries and waits as [`AsyncIo::read_with`] does, so any number
+    /// of tasks can do this at once.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future gives up the wait, and never leaves an operation half done.
+    pub async fn read_with<R>(
+        &self,
+        operation: impl FnMut(&std::os::unix::net::UnixDatagram) -> io::Result<R>,
+    ) -> io::Result<R> {
+        self.io.read_with(operation).await
+    }
+
+    /// Runs `operation` on the socket until it no longer fails with
+    /// [`WouldBlock`](io::ErrorKind::WouldBlock), waiting for the socket to be writable in between.
+    ///
+    /// This is for a write that the methods of this type do not make, such as a `sendmsg` that
+    /// sends file descriptors along with a datagram. `operation` gets the std socket, which is in
+    /// non-blocking mode, and must not block: it runs on the thread that all tasks of the runtime
+    /// share. This returns, retries and waits as [`AsyncIo::write_with`] does, so any number of
+    /// tasks can do this at once.
+    ///
+    /// On unix, a write to a peer that has gone away raises `SIGPIPE` unless the operation sends
+    /// with `MSG_NOSIGNAL`, as the writes of this type do. Apple's platforms have no such flag, so
+    /// there the socket has `SO_NOSIGPIPE` set instead, which makes such a write fail too.
+    ///
+    /// The wait for the socket to be writable only works for a datagram to the socket's connected
+    /// peer, sent without an address of its own. Linux reports a socket that sends to an address of
+    /// its choosing as writable whether or not the receiver has room, and wakes nobody once the
+    /// receiver has room again. So an operation that sends to such an address, such as a `sendmsg`
+    /// with a destination, and fails with `WouldBlock` because the receiver's queue is full, may
+    /// wait for good, or, where the runtime waits on `poll(2)`, be retried in a busy loop. Connect
+    /// the socket with [`connect`](UnixDatagram::connect) first, or create it with
+    /// [`pair`](UnixDatagram::pair), and send to its peer. [`send_to`](UnixDatagram::send_to)
+    /// sends to an address of its choosing, by trying again on a timer instead.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future gives up the wait, and never leaves an operation half done.
+    pub async fn write_with<R>(
+        &self,
+        operation: impl FnMut(&std::os::unix::net::UnixDatagram) -> io::Result<R>,
+    ) -> io::Result<R> {
+        self.io.write_with(operation).await
+    }
+
+    /// The polling version of [`read_with`](UnixDatagram::read_with), for implementing poll-based
+    /// traits.
+    ///
+    /// Runs `operation` on the socket. If it fails with [`WouldBlock`](io::ErrorKind::WouldBlock),
+    /// this arranges for the waker of `cx` to be woken once the socket is readable, and returns
+    /// [`Poll::Pending`], as [`AsyncIo::poll_read_with`] does.
+    ///
+    /// It keeps only one waiting task for reading. A second task that waits replaces the first one,
+    /// which is then never woken.
+    pub fn poll_read_with<R>(
+        &self,
+        cx: &mut Context<'_>,
+        operation: impl FnMut(&std::os::unix::net::UnixDatagram) -> io::Result<R>,
+    ) -> Poll<io::Result<R>> {
+        self.io.poll_read_with(cx, operation)
+    }
+
+    /// The polling version of [`write_with`](UnixDatagram::write_with), for implementing poll-based
+    /// traits.
+    ///
+    /// Runs `operation` on the socket. If it fails with [`WouldBlock`](io::ErrorKind::WouldBlock),
+    /// this arranges for the waker of `cx` to be woken once the socket is writable, and returns
+    /// [`Poll::Pending`], as [`AsyncIo::poll_write_with`] does.
+    ///
+    /// It keeps only one waiting task for writing. A second task that waits replaces the first one,
+    /// which is then never woken.
+    ///
+    /// As for [`write_with`](UnixDatagram::write_with), the wait only works for a datagram to the
+    /// socket's connected peer, sent without an address of its own.
+    pub fn poll_write_with<R>(
+        &self,
+        cx: &mut Context<'_>,
+        operation: impl FnMut(&std::os::unix::net::UnixDatagram) -> io::Result<R>,
+    ) -> Poll<io::Result<R>> {
+        self.io.poll_write_with(cx, operation)
     }
 }
 

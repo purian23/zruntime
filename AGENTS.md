@@ -601,7 +601,10 @@ wait in them at once. The poll-based traits and the `Incoming` streams go throug
 and `poll_write_with` instead, and so through `Registration::poll_io`, which keeps one waker per
 direction: a socket serves one waiting reader and one waiting writer at a time through them, and
 neither kind of wait takes the place of the other. A stream implements `futures-io`'s traits for
-`&Stream` as well, which is how a reader and a writer share it. No socket is `Clone`.
+`&Stream` as well, which is how a reader and a writer share it. No socket is `Clone`. The streams
+and the datagram sockets also hand their `AsyncIo`'s `read_with`, `write_with`, `poll_read_with`
+and `poll_write_with` on, for operations of the caller's on the std socket that none of their own
+methods make, such as passing descriptors with `recvmsg` and `sendmsg`.
 
 **Signals (the `signal` feature)**: what handles a signal is set for the process as a whole, so one
 registry serves every runtime and every listener: `REGISTRY` in `src/signal/mod.rs`, a `Mutex` of
