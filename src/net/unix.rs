@@ -1,7 +1,8 @@
 //! Unix-domain sockets, on unix platforms only.
 //!
-//! This module has [`UnixListener`], [`UnixStream`] and [`UnixDatagram`], and the [`Incoming`]
-//! stream of the connections a listener accepts.
+//! This module has [`UnixListener`], [`UnixStream`] and [`UnixDatagram`], the [`Incoming`]
+//! stream of the connections a listener accepts, and the [`ReadHalf`] and [`WriteHalf`] that
+//! [`UnixStream::into_split`] splits a stream into.
 //!
 //! A unix-domain socket is named by a path in the file system. Binding a listener or a datagram
 //! socket to a path creates a socket file there. A stream connects to a listener, and a datagram
@@ -452,6 +453,61 @@ where
         self.io.get_ref().shutdown(how)
     }
 
+    /// Splits the stream into a half that reads and a half that writes, which can each be moved on
+    /// their own: the reader to one task and the writer to another, say.
+    ///
+    /// The halves share the stream, and its socket stays open until both are dropped. Closing the
+    /// write half shuts down the socket's write half, as closing the stream does, and the peer then
+    /// reads the end of the stream. Dropping the write half does not. A reader and a writer that
+    /// need not be moved can share the stream instead, as a `&UnixStream` reads and writes too.
+    ///
+    /// The halves run on the stream's runtime, and carry its flavour: those of a
+    /// `UnixStream<Shared>` can be sent to and used from any thread, and those of a
+    /// `UnixStream<Local>` stay on the thread that made the stream.
+    ///
+    /// # Example
+    ///
+    /// The writing half of a stream goes to a task of its own, which sends a message and closes the
+    /// half. The reading half stays, and reads the answer.
+    ///
+    /// ```
+    /// use futures::{AsyncReadExt, AsyncWriteExt};
+    /// use zruntime::{LocalRuntime, net::unix::UnixStream};
+    ///
+    /// let runtime = LocalRuntime::new()?;
+    /// let (client, mut server) = UnixStream::pair(&runtime)?;
+    /// let (mut reader, mut writer) = client.into_split();
+    ///
+    /// runtime.block_on(async {
+    ///     let writing = runtime.spawn("writer", async move {
+    ///         writer.write_all(b"ping").await?;
+    ///         writer.close().await
+    ///     });
+    ///
+    ///     let mut message = Vec::new();
+    ///     server.read_to_end(&mut message).await?;
+    ///     assert_eq!(message, b"ping");
+    ///     writing.await??;
+    ///
+    ///     server.write_all(b"pong").await?;
+    ///     let mut answer = [0; 4];
+    ///     reader.read_exact(&mut answer).await?;
+    ///     assert_eq!(&answer, b"pong");
+    ///     # Ok::<_, std::io::Error>(())
+    /// })?;
+    /// # Ok::<_, std::io::Error>(())
+    /// ```
+    pub fn into_split(self) -> (ReadHalf<M>, WriteHalf<M>) {
+        let stream = M::new_ptr(self);
+
+        (
+            ReadHalf {
+                stream: stream.clone(),
+            },
+            WriteHalf { stream },
+        )
+    }
+
     /// Runs `operation` on the stream until it no longer fails with
     /// [`WouldBlock`](io::ErrorKind::WouldBlock), waiting for the stream to be readable in between.
     ///
@@ -667,6 +723,206 @@ where
 {
     fn as_raw_fd(&self) -> RawFd {
         self.io.get_ref().as_raw_fd()
+    }
+}
+
+/// The half of a [`UnixStream`] that reads, which [`UnixStream::into_split`] makes.
+///
+/// It reads as the stream does: through its `AsyncRead` implementation, and through
+/// [`read_with`](ReadHalf::read_with) and [`poll_read_with`](ReadHalf::poll_read_with) for
+/// operations of the caller's. It shares the stream with the [`WriteHalf`], and the socket stays
+/// open until both are dropped.
+///
+/// Only one task at a time can wait to read through the `AsyncRead` implementation and
+/// `poll_read_with`, as for the stream.
+pub struct ReadHalf<M = Local>
+where
+    M: Mode,
+{
+    stream: M::Ptr<UnixStream<M>>,
+}
+
+impl<M> ReadHalf<M>
+where
+    M: Mode,
+{
+    /// Runs `operation` on the stream, waiting for it to be readable where it would block, as
+    /// [`UnixStream::read_with`] does.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future gives up the wait, and never leaves an operation half done.
+    pub async fn read_with<R>(
+        &self,
+        operation: impl FnMut(&std::os::unix::net::UnixStream) -> io::Result<R>,
+    ) -> io::Result<R> {
+        self.stream.read_with(operation).await
+    }
+
+    /// The polling version of [`read_with`](ReadHalf::read_with), as
+    /// [`UnixStream::poll_read_with`] is.
+    pub fn poll_read_with<R>(
+        &self,
+        cx: &mut Context<'_>,
+        operation: impl FnMut(&std::os::unix::net::UnixStream) -> io::Result<R>,
+    ) -> Poll<io::Result<R>> {
+        self.stream.poll_read_with(cx, operation)
+    }
+
+    /// The socket address of this end of the connection, as [`UnixStream::local_addr`] gives it.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.stream.local_addr()
+    }
+
+    /// The socket address of the peer, as [`UnixStream::peer_addr`] gives it.
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.stream.peer_addr()
+    }
+}
+
+impl<M> AsyncRead for ReadHalf<M>
+where
+    M: Mode,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut &*self.stream).poll_read(cx, buf)
+    }
+}
+
+impl<M> fmt::Debug for ReadHalf<M>
+where
+    M: Mode,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ReadHalf").field(&*self.stream).finish()
+    }
+}
+
+impl<M> AsFd for ReadHalf<M>
+where
+    M: Mode,
+{
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.as_fd()
+    }
+}
+
+impl<M> AsRawFd for ReadHalf<M>
+where
+    M: Mode,
+{
+    fn as_raw_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
+    }
+}
+
+/// The half of a [`UnixStream`] that writes, which [`UnixStream::into_split`] makes.
+///
+/// It writes as the stream does: through its `AsyncWrite` implementation, and through
+/// [`write_with`](WriteHalf::write_with) and [`poll_write_with`](WriteHalf::poll_write_with) for
+/// operations of the caller's. It shares the stream with the [`ReadHalf`], and the socket stays
+/// open until both are dropped.
+///
+/// Closing the half (for example with the `close` method of `AsyncWriteExt`) shuts down the write
+/// half of the socket, as closing the stream does, and the peer then reads the end of the stream.
+/// Dropping the half does not.
+///
+/// Only one task at a time can wait to write through the `AsyncWrite` implementation and
+/// `poll_write_with`, as for the stream.
+pub struct WriteHalf<M = Local>
+where
+    M: Mode,
+{
+    stream: M::Ptr<UnixStream<M>>,
+}
+
+impl<M> WriteHalf<M>
+where
+    M: Mode,
+{
+    /// Runs `operation` on the stream, waiting for it to be writable where it would block, as
+    /// [`UnixStream::write_with`] does.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future gives up the wait, and never leaves an operation half done.
+    pub async fn write_with<R>(
+        &self,
+        operation: impl FnMut(&std::os::unix::net::UnixStream) -> io::Result<R>,
+    ) -> io::Result<R> {
+        self.stream.write_with(operation).await
+    }
+
+    /// The polling version of [`write_with`](WriteHalf::write_with), as
+    /// [`UnixStream::poll_write_with`] is.
+    pub fn poll_write_with<R>(
+        &self,
+        cx: &mut Context<'_>,
+        operation: impl FnMut(&std::os::unix::net::UnixStream) -> io::Result<R>,
+    ) -> Poll<io::Result<R>> {
+        self.stream.poll_write_with(cx, operation)
+    }
+
+    /// The socket address of this end of the connection, as [`UnixStream::local_addr`] gives it.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.stream.local_addr()
+    }
+
+    /// The socket address of the peer, as [`UnixStream::peer_addr`] gives it.
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.stream.peer_addr()
+    }
+}
+
+impl<M> AsyncWrite for WriteHalf<M>
+where
+    M: Mode,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut &*self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut &*self.stream).poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut &*self.stream).poll_close(cx)
+    }
+}
+
+impl<M> fmt::Debug for WriteHalf<M>
+where
+    M: Mode,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("WriteHalf").field(&*self.stream).finish()
+    }
+}
+
+impl<M> AsFd for WriteHalf<M>
+where
+    M: Mode,
+{
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.as_fd()
+    }
+}
+
+impl<M> AsRawFd for WriteHalf<M>
+where
+    M: Mode,
+{
+    fn as_raw_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
     }
 }
 

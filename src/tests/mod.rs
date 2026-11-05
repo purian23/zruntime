@@ -1228,9 +1228,32 @@ struct LocalUdpSocketsStayOnTheirThread;
 /// sent::<zruntime::net::unix::Incoming<'static, zruntime::Local>>();
 /// ```
 ///
+/// ...and the halves of a stream split with `into_split` share the stream, so they are not `Send`
+/// either...
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::net::unix::ReadHalf<zruntime::Local>>();
+/// ```
+///
+/// ```compile_fail
+/// fn sent<T>()
+/// where
+///     T: Send,
+/// {
+/// }
+///
+/// sent::<zruntime::net::unix::WriteHalf<zruntime::Local>>();
+/// ```
+///
 /// ...while the same sockets built on a shared runtime may go anywhere, and so may the stream of
-/// the connections a listener accepts: which says the checks above fail for the reason they were
-/// written for and no other.
+/// the connections a listener accepts and the halves of a stream: which says the checks above fail
+/// for the reason they were written for and no other.
 ///
 /// ```
 /// fn sent_and_shared<T>()
@@ -1243,6 +1266,8 @@ struct LocalUdpSocketsStayOnTheirThread;
 /// sent_and_shared::<zruntime::net::unix::UnixListener<zruntime::Shared>>();
 /// sent_and_shared::<zruntime::net::unix::UnixDatagram<zruntime::Shared>>();
 /// sent_and_shared::<zruntime::net::unix::Incoming<'static, zruntime::Shared>>();
+/// sent_and_shared::<zruntime::net::unix::ReadHalf<zruntime::Shared>>();
+/// sent_and_shared::<zruntime::net::unix::WriteHalf<zruntime::Shared>>();
 /// ```
 #[cfg(all(doctest, feature = "unix", unix))]
 struct LocalUnixSocketsStayOnTheirThread;
