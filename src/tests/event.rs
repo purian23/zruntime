@@ -14,16 +14,18 @@
 //! was woken or dropped by, and that one that panics as it is woken leaves the others woken all the
 //! same.
 //!
-//! The last five drive one event from many threads at once — through listeners taken just as
-//! another thread changes the condition they are for and notifies, through a listener dropped just
-//! as another thread notifies, through listeners polled for the first time while one notification
-//! for all of them is sent, and through listeners that give up the moment a notification reaches
-//! them — and check that no notification is lost on the way, and that one that finds nobody to
-//! reach comes after whatever left nobody there. They are shrunk under Miri, which runs them far
-//! more slowly, and which also lets an atomic load see an older value than the hardware would, as
-//! the memory model allows: under it, the first of them fails without the fence `listen` makes or
-//! the one a notification makes, and the second without the ordering of the word a notification
-//! looks at without the event's lock, which a run on the hardware alone can hide. Driving an event
+//! The last seven drive one event from many threads at once — through listeners taken while other
+//! threads keep the event's lock busy and notified right after, on the thread that took them or on
+//! one they were handed to, through listeners taken just as another thread changes the condition
+//! they are for and notifies, through a listener dropped just as another thread notifies, through
+//! listeners polled for the first time while one notification for all of them is sent, and through
+//! listeners that give up the moment a notification reaches them — and check that no notification
+//! is lost on the way, and that one that finds nobody to reach comes after whatever left nobody
+//! there. They are shrunk under Miri, which runs them far more slowly, and which also lets an
+//! atomic load see an older value than the hardware would, as the memory model allows: under it,
+//! the third of them fails without the fence `listen` makes or the one a notification makes, and
+//! the fourth without the ordering of the word a notification looks at without the event's lock,
+//! which a run on the hardware alone can hide. Driving an event
 //! from many threads through a lock built on it, and through wakers that come back into it, is
 //! tested with the locks, in the `lock` tests.
 
@@ -35,6 +37,7 @@ use std::{
     sync::{
         Arc, Barrier, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
     thread,
@@ -663,6 +666,57 @@ fn a_listener_takes_the_slot_of_one_gone() {
     assert_eq!(event.slots(), Some(3));
 }
 
+/// A listener is in the queue as soon as `listen` returns, however busy other threads keep the
+/// event's lock: the notification sent next reaches it, and it completes on its next poll.
+///
+/// An event that, finding its lock taken, left the listener for whoever held the lock to put in
+/// the queue would hand the listener out before it was there, and a notification that took the
+/// lock first would reach nobody: lost, though it was sent after `listen` returned.
+#[test]
+#[timeout(15000)]
+fn a_listener_is_queued_as_listen_returns_however_busy_the_lock_is() {
+    let rounds = if cfg!(miri) { 30 } else { 10_000 };
+    let event = Event::new();
+
+    contending(&event, || {
+        for _ in 0..rounds {
+            let mut listener = event.listen();
+
+            assert_eq!(event.notify(1), 1);
+            assert!(ready(&mut listener));
+        }
+    });
+}
+
+/// A listener taken on one thread and handed to a second is in the queue by the time the second
+/// has it, however busy still other threads keep the event's lock: a notification the second
+/// sends reaches it, and it completes on its next poll.
+///
+/// The hand-over, through a channel, is all that orders the notification after the `listen`. The
+/// first thread takes its next listener as soon as it has handed one over, which may be while the
+/// notification for that one is sent: the next is behind it in the queue, and so not reached.
+#[test]
+#[timeout(15000)]
+fn a_listener_taken_on_another_thread_is_queued_as_listen_returns_however_busy_the_lock_is() {
+    let rounds = if cfg!(miri) { 10 } else { 10_000 };
+    let event = &Event::new();
+
+    contending(event, || {
+        thread::scope(|scope| {
+            // With no room in the channel, each listener is handed over before the next is taken.
+            let (sender, receiver) = mpsc::sync_channel(0);
+            scope.spawn(move || while sender.send(event.listen()).is_ok() {});
+
+            for _ in 0..rounds {
+                let mut listener = receiver.recv().unwrap();
+
+                assert_eq!(event.notify(1), 1);
+                assert!(ready(&mut listener));
+            }
+        });
+    });
+}
+
 /// Listeners taken on two threads just as a third changes the condition they are for and notifies
 /// are reached by the notification, unless the check that follows each listener's taking sees the
 /// change: the listen-then-check pattern, raced round after round.
@@ -825,6 +879,33 @@ where
             counter
         })
         .collect()
+}
+
+/// Calls `f` while two other threads take the lock of `event` over and over, by formatting it,
+/// which takes the lock and changes nothing, and stops them once `f` has returned or unwound.
+fn contending<F>(event: &Event, f: F)
+where
+    F: FnOnce(),
+{
+    let started = Barrier::new(3);
+    let stop = AtomicBool::new(false);
+
+    thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(|| {
+                started.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = format!("{event:?}");
+                }
+            });
+        }
+        // Raised as `f` returns or unwinds, so that the threads stop: the scope waits for them
+        // before it returns, or before it raises the panic of `f` again.
+        let _stop = Raise(&stop);
+        started.wait();
+
+        f();
+    });
 }
 
 /// Queues listeners that are each dropped by a thread of their own once a notification reaches
@@ -1056,6 +1137,15 @@ unsafe fn drop_raw_task(data: *const ()) {
     // `&'static RawTask`.
     let task = unsafe { &*data.cast::<RawTask>() };
     task.drops.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Raises the flag it holds as it is dropped.
+struct Raise<'a>(&'a AtomicBool);
+
+impl Drop for Raise<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 /// A future that polls its listener once, to store the waker, and drops it unpolled once that
