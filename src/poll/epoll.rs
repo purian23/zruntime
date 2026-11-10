@@ -212,7 +212,11 @@ impl Poller {
                 None
             }
             None => {
-                if self.armed.swap(false, Ordering::Relaxed) {
+                // A load, then a store only where the timer is armed, rather than a swap: only
+                // the driving thread waits, and on the common path, with the timer not armed,
+                // this costs a plain load and no atomic read-modify-write.
+                if self.armed.load(Ordering::Relaxed) {
+                    self.armed.store(false, Ordering::Relaxed);
                     self.set_timer(Duration::ZERO)?;
                 }
 
